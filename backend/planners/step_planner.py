@@ -21,11 +21,33 @@ def _touches_same_z(placed: Set[Cell], cells: Set[Cell]) -> bool:
                 return True
     return False
 
-def _supported(below_occ: Set[Tuple[int,int]], cells: Set[Cell]) -> bool:
+def _supported_ratio(below_occ: Set[Tuple[int,int]], cells: Set[Cell]) -> float:
+    if not cells:
+        return 0.0
+    supported = 0
+    for (z, x, y) in cells:
+        if z == 0 or (x, y) in below_occ:
+            supported += 1
+    return supported / len(cells)
+
+def _supported_hard(below_occ: Set[Tuple[int,int]], cells: Set[Cell]) -> bool:
+    # At z=0 always OK
     for (z, x, y) in cells:
         if z == 0:
-            continue
-        if (x, y) not in below_occ:
+            return True
+        break
+    # Require >=60% of cells supported
+    if _supported_ratio(below_occ, cells) < 0.60:
+        return False
+    # extra rule for 1x1 at z>0: require at least 2 supported cells in its Moore neighborhood below
+    if len(cells) == 1:
+        z, x, y = next(iter(cells))
+        sup = 0
+        for nx in (x-1, x, x+1):
+            for ny in (y-1, y, y+1):
+                if (nx, ny) in below_occ:
+                    sup += 1
+        if sup < 2:   # needs broader base underneath
             return False
     return True
 
@@ -46,15 +68,11 @@ def plan_steps_connectivity_batched(
     placements: List[Dict],
     batch_size: int = 8,
     log_every: int = 25
-) -> Tuple[List[Dict], int]:
-    """
-    Connectivity + support, small batches, with hard safety rails.
-    Always assigns a step to at least one piece per iteration until everything is placed.
-    """
+):
     if not placements:
         return placements, 0
 
-    MAX_ITERS = 10 * len(placements)  # hard guard
+    MAX_ITERS = 10 * len(placements)
     occ_by_z = _build_below_occ(placements)
 
     by_z = defaultdict(list)
@@ -78,12 +96,12 @@ def plan_steps_connectivity_batched(
     while assigned < N:
         iters += 1
         if iters > MAX_ITERS:
-            # fail-safe: dump everything left into one final step
+            # force completion to avoid hangs
             for p in remaining:
                 p["step"] = step
             assigned += len(remaining)
             remaining.clear()
-            print(f"[WARN] step planner hit MAX_ITERS; forced completion at step {step}.")
+            print(f"[WARN] planner hit MAX_ITERS; forced completion at step {step}.")
             step += 1
             break
 
@@ -93,8 +111,10 @@ def plan_steps_connectivity_batched(
         for p in remaining:
             cells = _cells(p)
             z = int(p.get("z", 0))
-            if not _supported(occ_by_z[z-1] if z > 0 else set(), cells):
+            below = occ_by_z[z-1] if z > 0 else set()
+            if not _supported_hard(below, cells):
                 continue
+
             has_any_on_z = any(c[0] == z for c in placed_cells)
             if has_any_on_z:
                 if _touches_same_z(placed_cells, cells):
@@ -102,35 +122,30 @@ def plan_steps_connectivity_batched(
                 else:
                     bridges.append((_nearest_to_cluster(p, cluster_centers_by_z[z]), p))
             else:
-                strict.append(p)  # seed piece for this z
+                strict.append(p)  # seed for this layer
 
         picked: List[Dict] = strict[:batch_size]
 
         if not picked:
-            # Allow exactly one bridge (closest) to seed adjacency on this z
             if bridges:
                 bridges.sort(key=lambda t: t[0])
                 picked.append(bridges[0][1])
             else:
-                # last resort: take any supported piece to ensure progress
+                # last resort: any supported piece
                 for p in remaining:
-                    cells = _cells(p)
                     z = int(p.get("z", 0))
-                    if _supported(occ_by_z[z-1] if z > 0 else set(), cells):
+                    if _supported_hard(occ_by_z[z-1] if z > 0 else set(), _cells(p)):
                         picked.append(p)
                         break
                 if not picked:
-                    # truly pathological — force pick the first remaining
                     picked.append(remaining[0])
 
-        # assign step & update
         for p in picked:
             p["step"] = step
             z = int(p.get("z", 0))
             for c in _cells(p):
                 placed_cells.add(c)
-            cx, cy = _center_xy(p)
-            cluster_centers_by_z[z].append((cx, cy))
+            cluster_centers_by_z[z].append(_center_xy(p))
 
         ids = set(id(p) for p in picked)
         remaining = [p for p in remaining if id(p) not in ids]
